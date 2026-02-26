@@ -1,0 +1,17 @@
+# ── OCR ──────────────────────────────────────────────────────────────────────
+paddlepaddle
+paddleocr
+
+# ── LangChain + OpenAI ────────────────────────────────────────────────────────
+langchain
+langchain-core
+langchain-openai
+openai
+
+# ── Image / Vision ────────────────────────────────────────────────────────────
+Pillow
+opencv-python
+numpy
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv
