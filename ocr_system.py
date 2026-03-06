@@ -24,6 +24,7 @@ load_dotenv()
 
 # ── EasyOCR ───────────────────────────────────────────────────────────────────
 import easyocr
+import torch
 
 # ── LangGraph / LangChain / OpenAI ───────────────────────────────────────────
 from langchain_core.tools import tool
@@ -32,8 +33,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 # ── Global OCR model (loaded once at startup) ─────────────────────────────────
-print("\nLoading EasyOCR model (first run downloads weights ~100 MB)...")
-ocr_model = easyocr.Reader(["en"], gpu=False, verbose=False)  # gpu=True if NVIDIA GPU
+_gpu = torch.cuda.is_available()
+print(f"\nLoading EasyOCR model (first run downloads weights ~100 MB)... [GPU: {'yes' if _gpu else 'no - CPU only'}]")
+ocr_model = easyocr.Reader(["en"], gpu=_gpu, verbose=False)
 print("EasyOCR ready!\n")
 
 
@@ -88,7 +90,7 @@ Workflow:
 """
 
 def create_agent():
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     return create_react_agent(llm, [ocr_read_document])
 
 
@@ -99,7 +101,7 @@ def create_agent():
 def print_banner():
     print("=" * 60)
     print("   OCR DOCUMENT PROCESSING SYSTEM")
-    print("   EasyOCR  +  GPT-4o  +  LangGraph")
+    print("   EasyOCR  +  GPT-4o-mini  +  LangGraph")
     print("=" * 60)
 
 def separator(title: str = ""):
@@ -121,6 +123,7 @@ def run_agent(agent, image_path: str, question: str, verbose: bool = True) -> st
     ]
 
     if verbose:
+        final_content = ""
         for chunk in agent.stream({"messages": messages}):
             for node, update in chunk.items():
                 if node == "tools":
@@ -129,9 +132,14 @@ def run_agent(agent, image_path: str, question: str, verbose: bool = True) -> st
                         print(f"\n  [Tool: {tool_name}]")
                         content = str(msg.content)
                         print(f"  {content[:500]}{'...' if len(content) > 500 else ''}")
-
-    result = agent.invoke({"messages": messages})
-    return result["messages"][-1].content
+                elif node == "agent":
+                    msgs = update.get("messages", [])
+                    if msgs:
+                        final_content = msgs[-1].content
+        return final_content
+    else:
+        result = agent.invoke({"messages": messages})
+        return result["messages"][-1].content
 
 
 # ─────────────────────────────────────────────────────────────────────────────
