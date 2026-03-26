@@ -26,11 +26,9 @@ load_dotenv()
 import easyocr
 import torch
 
-# ── LangGraph / LangChain / OpenAI ───────────────────────────────────────────
-from langchain_core.tools import tool
+# ── LangChain / OpenAI ───────────────────────────────────────────────────────
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 
 # ── Global OCR model (loaded once at startup) ─────────────────────────────────
 _gpu = torch.cuda.is_available()
@@ -40,58 +38,33 @@ print("EasyOCR ready!\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OCR Tool
+# OCR (direct — no LangChain tool wrapper needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@tool
-def ocr_read_document(image_path: str) -> List[Dict[str, Any]]:
-    """
-    Read an image file using EasyOCR and return all detected text.
+# Cache: image_path → extracted text string (avoids re-running OCR on same image)
+_ocr_cache: Dict[str, str] = {}
 
-    Returns a list of dicts, each containing:
-      - 'text'       : recognized text string
-      - 'bbox'       : bounding box [x_min, y_min, x_max, y_max] in pixels
-      - 'confidence' : float 0-1 (how confident the model is)
-    """
-    try:
-        results = ocr_model.readtext(image_path)
-
-        extracted = []
-        for bbox_points, text, confidence in results:
-            # bbox_points = [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
-            xs = [p[0] for p in bbox_points]
-            ys = [p[1] for p in bbox_points]
-            extracted.append({
-                "text":       text,
-                "bbox":       [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
-                "confidence": round(float(confidence), 3),
-            })
-
-        return extracted or [{"info": "No text detected in image."}]
-
-    except Exception as e:
-        return [{"error": f"OCR failed: {e}"}]
+def run_ocr(image_path: str) -> str:
+    """Run EasyOCR on image_path and return extracted text. Results are cached."""
+    if image_path in _ocr_cache:
+        return _ocr_cache[image_path]
+    results = ocr_model.readtext(image_path)
+    text = "\n".join([item[1] for item in results]) if results else "No text detected."
+    _ocr_cache[image_path] = text
+    return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent
+# LLM
 # ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert document analysis assistant.
+Answer the user's question accurately based only on the provided OCR text.
+Return a clear, structured answer. Use JSON when extracting specific fields.
+If some text seems garbled, use context clues to interpret it correctly."""
 
-You have one tool:
-  ocr_read_document – extracts all text + bounding boxes from any image.
-
-Workflow:
-1. Call ocr_read_document with the image path to get all text.
-2. Reason over the extracted text to answer the user's question accurately.
-3. Return a clear, structured answer. Use JSON when extracting specific fields.
-4. If some text seems garbled, use context clues to interpret it correctly.
-"""
-
-def create_agent():
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    return create_react_agent(llm, [ocr_read_document])
+def create_llm():
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,35 +84,24 @@ def separator(title: str = ""):
     else:
         print("─" * 60)
 
-def run_agent(agent, image_path: str, question: str, verbose: bool = True) -> str:
-    """Invoke the agent and return the final answer."""
-    user_msg = (
-        f"Document to analyze: '{image_path}'\n\n"
-        f"User's question: {question}"
-    )
+def run_query(llm, ocr_text: str, question: str, verbose: bool = True) -> str:
+    """Send OCR text + question to LLM in a single call and return the answer."""
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=user_msg),
+        HumanMessage(content=f"OCR extracted text:\n\n{ocr_text}\n\nQuestion: {question}"),
     ]
 
     if verbose:
-        final_content = ""
-        for chunk in agent.stream({"messages": messages}):
-            for node, update in chunk.items():
-                if node == "tools":
-                    for msg in update.get("messages", []):
-                        tool_name = getattr(msg, "name", "tool")
-                        print(f"\n  [Tool: {tool_name}]")
-                        content = str(msg.content)
-                        print(f"  {content[:500]}{'...' if len(content) > 500 else ''}")
-                elif node == "agent":
-                    msgs = update.get("messages", [])
-                    if msgs:
-                        final_content = msgs[-1].content
-        return final_content
+        # Stream tokens for perceived speed
+        answer = ""
+        for chunk in llm.stream(messages):
+            token = chunk.content
+            print(token, end="", flush=True)
+            answer += token
+        print()
+        return answer
     else:
-        result = agent.invoke({"messages": messages})
-        return result["messages"][-1].content
+        return llm.invoke(messages).content
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,10 +140,14 @@ def main():
         sys.exit(1)
 
     print(f"\nDocument : {Path(image_path).resolve()}")
-    print("Building agent...")
-    agent = create_agent()
-    print("Agent ready!")
-    print("Type your question. Type 'quit' to exit.")
+
+    # ── Run OCR once upfront ───────────────────────────────────────────────────
+    print("Running OCR...")
+    ocr_text = run_ocr(image_path)
+    print(f"OCR done — {len(ocr_text.splitlines())} text regions extracted.")
+
+    llm = create_llm()
+    print("LLM ready! Type your question. Type 'quit' to exit.")
     separator()
 
     # ── Question loop ─────────────────────────────────────────────────────────
@@ -203,11 +169,11 @@ def main():
         if not question:
             continue
 
-        separator("AGENT RESPONSE")
+        separator("ANSWER")
         try:
-            answer = run_agent(agent, image_path, question, verbose=not args.quiet)
-            print("\n FINAL ANSWER:\n")
-            print(answer)
+            answer = run_query(llm, ocr_text, question, verbose=not args.quiet)
+            if args.quiet:
+                print(answer)
         except Exception as e:
             print(f"\n[ERROR] {e}")
 

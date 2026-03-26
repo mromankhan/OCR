@@ -17,4 +17,5 @@ dependencies = [
     "paddlepaddle>=3.3.0",
     "pillow>=12.1.1",
     "python-dotenv>=1.2.1",
+    "streamlit>=1.45.0",
 ]
