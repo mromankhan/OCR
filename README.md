@@ -52,3 +52,8 @@
 
   ---
   Key requirement: A valid OPENAI_API_KEY — without it, the script will exit with an error on startup.
+
+
+  # Run streamlit App 
+
+  uv run streamlit run app.py

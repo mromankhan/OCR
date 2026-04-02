@@ -5,13 +5,15 @@ Run: streamlit run app.py
 
 import os
 import torch
-import tempfile
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+from document_loader import extract_text, IMAGE_EXTS
 
 load_dotenv()
 
@@ -24,11 +26,16 @@ st.set_page_config(
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert document analysis assistant.
-Answer the user's question accurately based only on the provided OCR text.
+Answer the user's question accurately based only on the provided document text.
 Return a clear, structured answer. Use JSON when extracting specific fields.
 If some text seems garbled, use context clues to interpret it correctly."""
 
 SAMPLE_IMAGE = Path(__file__).parent / "Medical_report.jpg"
+
+# All accepted upload extensions
+ACCEPTED_TYPES = ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "webp",
+                  "pdf", "docx", "txt", "md", "markdown",
+                  "csv", "json", "xml", "html", "htm", "rst", "log"]
 
 
 # ── Load EasyOCR once (cached across reruns) ──────────────────────────────────
@@ -41,57 +48,78 @@ def load_ocr_model():
 
 
 @st.cache_resource(show_spinner=False)
-def load_llm():
+def load_llm(provider: str):
+    if provider == "gemini":
+        return ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
     return ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True)
 
 
-# ── OCR helper (cached per file bytes so same upload isn't re-processed) ──────
-@st.cache_data(show_spinner="Running OCR on image...")
-def run_ocr(_model, image_bytes: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        f.write(image_bytes)
-        tmp_path = f.name
-    try:
-        results = _model.readtext(tmp_path)
-        text = "\n".join([item[1] for item in results]) if results else "No text detected."
-    finally:
-        os.unlink(tmp_path)
-    return text
+# ── Universal document extractor (cached per file bytes) ──────────────────────
+@st.cache_data(show_spinner="Extracting text from document...")
+def process_document(_ocr_model, file_bytes: bytes, filename: str) -> str:
+    return extract_text(file_bytes, filename, _ocr_model)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        api_key = st.text_input("OpenAI API Key", type="password",
-                                placeholder="sk-...")
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
+    provider = st.selectbox(
+        "LLM Provider",
+        options=["openai", "gemini"],
+        format_func=lambda x: "OpenAI (GPT-4o-mini)" if x == "openai" else "Google Gemini 2.0 Flash",
+    )
+    st.session_state["provider"] = provider
+
+    st.divider()
+
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            api_key = st.text_input("OpenAI API Key", type="password",
+                                    placeholder="sk-...")
+            if api_key:
+                os.environ["OPENAI_API_KEY"] = api_key
+        else:
+            st.success("OpenAI API key loaded from .env")
     else:
-        st.success("API key loaded from .env")
+        api_key = os.getenv("GOOGLE_API_KEY", "")
+        if not api_key:
+            api_key = st.text_input("Google API Key", type="password",
+                                    placeholder="AIza...")
+            if api_key:
+                os.environ["GOOGLE_API_KEY"] = api_key
+        else:
+            st.success("Google API key loaded from .env")
 
     st.divider()
 
     ocr_model, gpu_available = load_ocr_model()
     hw = "GPU" if gpu_available else "CPU"
     st.info(f"EasyOCR running on **{hw}**")
+    st.caption("EasyOCR is used for images and scanned PDF pages.")
+
+    st.divider()
+    st.markdown("**Supported formats**")
+    st.caption("Images: JPG, PNG, BMP, TIFF, WEBP")
+    st.caption("Documents: PDF, DOCX")
+    st.caption("Text: TXT, MD, CSV, JSON, XML, HTML, RST")
 
     st.divider()
     if st.button("🗑️ Clear chat history"):
         st.session_state.messages = []
         st.rerun()
 
-    if st.button("🔄 Reset (new image)"):
+    if st.button("🔄 Reset (new document)"):
         for key in ["ocr_text", "messages", "image_name"]:
             st.session_state.pop(key, None)
         st.rerun()
 
 
 # ── Main UI ───────────────────────────────────────────────────────────────────
-st.title("🔍 OCR Document Analyzer")
-st.caption("Upload an image → extract text with EasyOCR → ask questions using GPT-4o-mini")
+st.title("🔍 Document Analyzer")
+_model_label = "Gemini 2.0 Flash" if st.session_state.get("provider") == "gemini" else "GPT-4o-mini"
+st.caption(f"Upload any document → extract text → ask questions using {_model_label}")
 
 # ── Session state init ────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
@@ -101,13 +129,13 @@ if "ocr_text" not in st.session_state:
 if "image_name" not in st.session_state:
     st.session_state.image_name = None
 
-# ── Image upload ──────────────────────────────────────────────────────────────
+# ── File upload ───────────────────────────────────────────────────────────────
 col1, col2 = st.columns([2, 1])
 
 with col1:
     uploaded = st.file_uploader(
-        "Upload image (JPG, PNG, BMP, TIFF)",
-        type=["jpg", "jpeg", "png", "bmp", "tiff", "webp"],
+        "Upload document (image, PDF, DOCX, TXT, MD, CSV, JSON, …)",
+        type=ACCEPTED_TYPES,
     )
 
 with col2:
@@ -116,44 +144,53 @@ with col2:
     use_sample = st.button("📄 Use sample Medical_report.jpg",
                            disabled=not SAMPLE_IMAGE.exists())
 
-# ── Determine active image ────────────────────────────────────────────────────
-image_bytes = None
-image_name = None
+# ── Determine active file ──────────────────────────────────────────────────────
+file_bytes = None
+file_name = None
 
 if uploaded:
-    image_bytes = uploaded.read()
-    image_name = uploaded.name
+    file_bytes = uploaded.read()
+    file_name = uploaded.name
 elif use_sample and SAMPLE_IMAGE.exists():
-    image_bytes = SAMPLE_IMAGE.read_bytes()
-    image_name = SAMPLE_IMAGE.name
+    file_bytes = SAMPLE_IMAGE.read_bytes()
+    file_name = SAMPLE_IMAGE.name
 
-# ── Process new image ─────────────────────────────────────────────────────────
-if image_bytes and image_name != st.session_state.image_name:
-    st.session_state.messages = []          # reset chat on new image
-    st.session_state.image_name = image_name
-    st.session_state.ocr_text = run_ocr(ocr_model, image_bytes)
+# ── Process new document ───────────────────────────────────────────────────────
+if file_bytes and file_name != st.session_state.image_name:
+    st.session_state.messages = []
+    st.session_state.image_name = file_name
+    st.session_state.ocr_text = process_document(ocr_model, file_bytes, file_name)
 
-# ── Show image + OCR text ─────────────────────────────────────────────────────
+# ── Show preview + extracted text ─────────────────────────────────────────────
 if st.session_state.ocr_text:
-    col_img, col_text = st.columns([1, 1])
+    ext = Path(st.session_state.image_name).suffix.lower() if st.session_state.image_name else ""
+    is_image = ext in IMAGE_EXTS
 
-    with col_img:
-        st.subheader("📷 Image")
-        if image_bytes:
-            st.image(image_bytes, use_container_width=True)
-        elif SAMPLE_IMAGE.exists():
-            st.image(str(SAMPLE_IMAGE), use_container_width=True)
-
-    with col_text:
+    if is_image:
+        col_img, col_text = st.columns([1, 1])
+        with col_img:
+            st.subheader("📷 Preview")
+            if file_bytes:
+                st.image(file_bytes, use_container_width=True)
+            elif SAMPLE_IMAGE.exists():
+                st.image(str(SAMPLE_IMAGE), use_container_width=True)
+        with col_text:
+            st.subheader("📝 Extracted Text")
+            lines = st.session_state.ocr_text.splitlines()
+            st.caption(f"{len(lines)} lines extracted")
+            with st.expander("View extracted text", expanded=True):
+                st.text(st.session_state.ocr_text)
+    else:
         st.subheader("📝 Extracted Text")
         lines = st.session_state.ocr_text.splitlines()
-        st.caption(f"{len(lines)} text regions found")
-        with st.expander("View raw OCR text", expanded=True):
+        st.caption(f"{len(lines)} lines extracted from **{st.session_state.image_name}**")
+        with st.expander("View extracted text", expanded=True):
             st.text(st.session_state.ocr_text)
 
     st.divider()
 
     # ── Chat interface ────────────────────────────────────────────────────────
+    st.divider()
     st.subheader("💬 Ask Questions")
 
     # Render previous messages
@@ -162,22 +199,24 @@ if st.session_state.ocr_text:
             st.markdown(msg["content"])
 
     # Chat input
-    if not os.getenv("OPENAI_API_KEY"):
-        st.warning("Enter your OpenAI API key in the sidebar to ask questions.")
+    _provider = st.session_state.get("provider", "openai")
+    _key_env = "GOOGLE_API_KEY" if _provider == "gemini" else "OPENAI_API_KEY"
+    _key_name = "Google API key" if _provider == "gemini" else "OpenAI API key"
+
+    if not os.getenv(_key_env):
+        st.warning(f"Enter your {_key_name} in the sidebar to ask questions.")
     else:
         if question := st.chat_input("Ask anything about this document..."):
-            # Show user message
             st.session_state.messages.append({"role": "user", "content": question})
             with st.chat_message("user"):
                 st.markdown(question)
 
-            # Stream assistant response
             with st.chat_message("assistant"):
-                llm = load_llm()
+                llm = load_llm(_provider)
                 messages = [
                     SystemMessage(content=SYSTEM_PROMPT),
                     HumanMessage(content=(
-                        f"OCR extracted text:\n\n{st.session_state.ocr_text}"
+                        f"Document text:\n\n{st.session_state.ocr_text}"
                         f"\n\nQuestion: {question}"
                     )),
                 ]
@@ -190,4 +229,4 @@ if st.session_state.ocr_text:
             st.session_state.messages.append({"role": "assistant", "content": response})
 
 else:
-    st.info("👆 Upload an image or click 'Use sample Medical_report.jpg' to get started.")
+    st.info("👆 Upload a document (image, PDF, DOCX, TXT, MD, …) or click 'Use sample Medical_report.jpg' to get started.")
